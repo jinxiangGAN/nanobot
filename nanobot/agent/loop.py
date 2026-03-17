@@ -47,6 +47,14 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
+    _IMAGE_SUMMARY_MAX_CHARS = 160
+    _IMAGE_SUMMARY_BAD_PREFIXES = (
+        "the user shared ",
+        "the user uploaded ",
+        "this image shows ",
+        "here is ",
+        "an image of ",
+    )
 
     def __init__(
         self,
@@ -441,7 +449,9 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
-        self._save_turn(session, all_msgs, 1 + len(history))
+        image_summary = await self._summarize_image_inputs(msg.content, msg.media if msg.media else None)
+
+        self._save_turn(session, all_msgs, 1 + len(history), image_summary=image_summary)
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
@@ -455,7 +465,72 @@ class AgentLoop:
             metadata=msg.metadata or {},
         )
 
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
+    async def _summarize_image_inputs(
+        self,
+        text: str,
+        media: list[str] | None,
+    ) -> str | None:
+        """Generate a short image summary for session persistence."""
+        if not media:
+            return None
+
+        content = self.context._build_user_content(text, media)
+        if isinstance(content, str):
+            return None
+
+        prompt_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Summarize the image input for future conversation context. "
+                    "Return exactly one short sentence with only visible, concrete details. "
+                    "Do not mention the user, intent, task, or any inferred meaning. "
+                    "Do not include preamble or markdown."
+                ),
+            },
+            {"role": "user", "content": content},
+        ]
+
+        response = await self.provider.chat_with_retry(
+            messages=prompt_messages,
+            model=self.model,
+            max_tokens=80,
+            temperature=0.0,
+        )
+        if response.finish_reason == "error":
+            return None
+        content = response.content if isinstance(response.content, str) else None
+        return self._normalize_image_summary(content)
+
+    @classmethod
+    def _normalize_image_summary(cls, content: str | None) -> str | None:
+        """Normalize the provider response into a short image summary sentence."""
+        text = (content or "").strip()
+        if not text:
+            return None
+
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        if not first_line:
+            return None
+
+        summary = first_line.removeprefix("[image summary:").removesuffix("]").strip()
+        lowered = summary.lower()
+        for prefix in cls._IMAGE_SUMMARY_BAD_PREFIXES:
+            if lowered.startswith(prefix):
+                summary = summary[len(prefix):].strip()
+                lowered = summary.lower()
+                break
+        if len(summary) > cls._IMAGE_SUMMARY_MAX_CHARS:
+            summary = summary[: cls._IMAGE_SUMMARY_MAX_CHARS].rstrip() + "..."
+        return summary or None
+
+    def _save_turn(
+        self,
+        session: Session,
+        messages: list[dict],
+        skip: int,
+        image_summary: str | None = None,
+    ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
         for m in messages[skip:]:
@@ -475,12 +550,21 @@ class AgentLoop:
                         continue
                 if isinstance(content, list):
                     filtered = []
+                    inserted_image_summary = False
                     for c in content:
                         if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                             continue  # Strip runtime context from multimodal messages
                         if (c.get("type") == "image_url"
                                 and c.get("image_url", {}).get("url", "").startswith("data:image/")):
-                            filtered.append({"type": "text", "text": "[image]"})
+                            if inserted_image_summary:
+                                continue
+                            text_value = (
+                                f"[image summary: {image_summary}]"
+                                if image_summary
+                                else "[image]"
+                            )
+                            filtered.append({"type": "text", "text": text_value})
+                            inserted_image_summary = True
                         else:
                             filtered.append(c)
                     if not filtered:
