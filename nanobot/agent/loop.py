@@ -49,11 +49,9 @@ class AgentLoop:
     _TOOL_RESULT_MAX_CHARS = 16_000
     _IMAGE_SUMMARY_MAX_CHARS = 160
     _IMAGE_SUMMARY_BAD_PREFIXES = (
-        "the user shared ",
-        "the user uploaded ",
         "this image shows ",
+        "the image shows ",
         "here is ",
-        "an image of ",
     )
 
     def __init__(
